@@ -11,6 +11,7 @@ the report. Never touches a real work folder or the network.
 import importlib.machinery
 import importlib.util
 import os
+import pty
 import re
 import shutil
 import subprocess
@@ -94,8 +95,9 @@ class World:
         self.nogh = tmp / "nogh"
         self.nogh.mkdir()
         (self.nogh / "git").symlink_to(shutil.which("git"))
-        env = {k: v for k, v in os.environ.items() if k not in ("GIT_SSH", "GIT_SSH_COMMAND")}
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_SSH", "GIT_SSH_COMMAND", "NO_COLOR")}
         env.update(
+            TERM="xterm",
             GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
             GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.com",
             GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.com",
@@ -152,7 +154,30 @@ class World:
         assert any(re.match(r"\d+ repos? under ", line) for line in result.out.splitlines()), result.out
         for line in result.out.splitlines():
             assert not line.startswith(("fatal:", "error:", "Traceback")), result.out
+        assert "\033[" not in result.out, "piped output should have no color"
         return result
+
+    def run_on_terminal(self, **env: str) -> str:
+        """gup-all's stdout when it's a terminal, with ANSI codes kept."""
+        controller, terminal = pty.openpty()
+        subprocess.run(
+            [sys.executable, str(GUP_ALL), str(self.work)], cwd=self.tmp, env={**self.env, **env},
+            stdout=terminal, stderr=subprocess.DEVNULL, check=False)
+        os.close(terminal)
+        chunks = []
+        # Reading a pty whose other end is closed raises EIO instead of returning b"".
+        while True:
+            try:
+                chunk = os.read(controller, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(controller)
+        out = b"".join(chunks).decode().replace("\r\n", "\n")
+        print(out)
+        return out
 
 
 class Repo:
@@ -1070,3 +1095,30 @@ def test_gone_branch_whose_commits_survive_gets_delete_hint(world):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+def test_report_is_colored_on_a_terminal(world):
+    r = world.new_repo("r")
+    r.merged_branch("done")
+    tip = r.git("rev-parse", "--short", "done")
+    r.commit("local")
+    out = world.run_on_terminal()
+    assert "\033[1;31mNeeds you:\033[0m" in out
+    assert "\033[1mDeleted merged branches" in out
+    assert f"branch done (\033[33m{tip}\033[0m)" in out
+    plain = re.sub(r"\033\[[0-9;]*m", "", out)
+    assert "  org/r/  on main: 1 unpushed" in plain, "color shouldn't shift the columns"
+
+
+def test_all_clear_is_green_on_a_terminal(world):
+    world.new_repo("r")
+    out = world.run_on_terminal()
+    assert "\033[32mAll clear: nothing needs you, nothing in progress.\033[0m" in out
+
+
+def test_no_color_turns_color_off_on_a_terminal(world):
+    r = world.new_repo("r")
+    r.commit("local")
+    out = world.run_on_terminal(NO_COLOR="1")
+    assert "Needs you:" in out
+    assert "\033[" not in out

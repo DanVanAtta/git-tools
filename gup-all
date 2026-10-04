@@ -33,9 +33,11 @@ Each repo's own git config and hooks run as you, so only point this at a
 folder of repos you trust.
 
 The report prints call-to-action last: "Needs you", then "Resume here".
+It's colored only on a terminal, and never when NO_COLOR is set.
 """
 
 import argparse
+import functools
 import os
 import shlex
 import shutil
@@ -46,6 +48,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 FETCH_JOBS = 8
 
@@ -87,6 +90,29 @@ def refusal(path: Path, stderr: str) -> str:
         return ("owned by another user, so git refuses it; to trust it: "
                 f"git config --global --add safe.directory {shlex.quote(str(path))}")
     return f"git can't read it: {first_line(stderr).removeprefix('fatal: ')}"
+
+
+BOLD, DIM, RED, GREEN, YELLOW = "1", "2", "1;31", "32", "33"
+
+
+@functools.cache
+def use_color(stream: TextIO) -> bool:
+    # Checked per stream, so 'gup-all | tee log' stays plain while progress on
+    # stderr is still colored.
+    return stream.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def paint(text: str, sgr: str, stream: TextIO | None = None) -> str:
+    """text in an ANSI style, closed on the same line so no style leaks past it."""
+    return f"\033[{sgr}m{text}\033[0m" if use_color(stream or sys.stdout) else text
+
+
+def error(message: str) -> None:
+    print(f"gup-all: {paint('error:', RED, sys.stderr)} {message}", file=sys.stderr)
+
+
+def progress(message: str) -> None:
+    print(paint(message, DIM, sys.stderr), file=sys.stderr)
 
 
 def count(n: int, noun: str) -> str:
@@ -494,7 +520,7 @@ class RepoSync:
                 tip = out("rev-parse", "--short", f"refs/heads/{b}", cwd=repo)
                 result = git("branch", "--quiet", "-D", "--end-of-options", b, cwd=repo)
                 if result.returncode == 0:
-                    self.report.deleted.append((self.name, f"branch {b} ({tip})"))
+                    self.report.deleted.append((self.name, f"branch {b} ({paint(tip, YELLOW)})"))
                 else:
                     self.need(f"branch {b} is merged but couldn't be deleted: {first_line(result.stderr)}")
                 continue
@@ -545,13 +571,13 @@ class RepoSync:
             self.need(f"{on(default)}: {ahead} unpushed")
 
 
-def section(title: str, entries: list[tuple[str, str]]) -> None:
+def section(title: str, entries: list[tuple[str, str]], style: str = BOLD) -> None:
     """Prints "path/  detail" entries as aligned columns under a heading."""
     if not entries:
         return
     width = max(len(name) for name, _ in entries)
     print()
-    print(title)
+    print(paint(title, style))
     for name, detail in entries:
         print(f"  {name.ljust(width)}  {detail}")
 
@@ -572,11 +598,11 @@ def print_report(report: Report, repo_count: int, root: Path) -> None:
         print(f"Skipped:    {'; '.join(skipped)}")
     section("Switched to default branch:", report.switched)
     section("Deleted merged branches (undo: git branch <name> <sha>):", report.deleted)
-    section("Needs you:", report.needs)
+    section("Needs you:", report.needs, RED)
     section("Resume here:", report.resume)
     if not report.needs and not report.resume:
         print()
-        print("All clear: nothing needs you, nothing in progress.")
+        print(paint("All clear: nothing needs you, nothing in progress.", GREEN))
 
 
 def main() -> int:
@@ -588,11 +614,11 @@ def main() -> int:
 
     root = Path(args.root)
     if not os.path.isdir(root):
-        print(f"gup-all: error: {root} is not a directory", file=sys.stderr)
+        error(f"{root} is not a directory")
         return 1
     root = root.resolve()
     if not shutil.which("git"):
-        print("gup-all: error: git not found on PATH", file=sys.stderr)
+        error("git not found on PATH")
         return 1
 
     # Paths relative to the root printed in the report's first line, with a
@@ -602,20 +628,18 @@ def main() -> int:
 
     repos, unreadable = find_repos(root)
     if not repos and unreadable:
-        print(f"gup-all: error: no readable git repos under {root}; can't read: {', '.join(map(name, unreadable))}",
-              file=sys.stderr)
+        error(f"no readable git repos under {root}; can't read: {', '.join(map(name, unreadable))}")
         return 1
     if not repos:
-        print(f"gup-all: error: no git repos found under {root} (looks two levels down, eg: {root}/org/repo)",
-              file=sys.stderr)
+        error(f"no git repos found under {root} (looks two levels down, eg: {root}/org/repo)")
         return 1
 
-    print(f"Fetching {count(len(repos), 'repo')} under {root} ...", file=sys.stderr)
+    progress(f"Fetching {count(len(repos), 'repo')} under {root} ...")
     with_origin = [r for r in repos if ok("remote", "get-url", "origin", cwd=r)]
     with ThreadPoolExecutor(max_workers=FETCH_JOBS) as pool:
         fetch_errors = dict(zip(with_origin, pool.map(fetch, with_origin)))
 
-    print("Syncing ...", file=sys.stderr)
+    progress("Syncing ...")
     report = Report(unreadable=[name(d) for d in unreadable])
     code = 0
     for repo in repos:
