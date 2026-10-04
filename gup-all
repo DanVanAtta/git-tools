@@ -1,0 +1,655 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Update every git repo under a work folder, up to two levels deep (eg:
+root/org/repo; hidden and symlinked dirs skipped), then report what needs you.
+
+Per repo: fetch --prune, then
+- a dirty tree (untracked files count), detached HEAD, or one
+  mid-rebase/merge/cherry-pick/revert is left alone: it's reported as active
+  work, and nothing is switched, deleted or pulled
+- a clean feature branch that's merged, or pushed and even with its own remote
+  branch, is switched off to the default branch
+- merged branches are deleted. "Merged" means a GitHub PR merged into the
+  default branch has exactly the local tip as its head (squash merges), or,
+  once the branch's remote branch is gone, that origin's default branch
+  contains it. A branch still on origin with no such PR is in use and kept, as
+  is one tracking the default branch itself, and a branch with commits made
+  after its merge is never deleted.
+- a branch whose remote is gone, with no merged PR, is flagged
+- branches checked out in other worktrees are never switched or deleted
+- if the default branch is checked out (including after a switch above), it's
+  rebased onto origin's like 'gup'; a conflicting rebase is aborted and
+  flagged, as are unpushed commits on it
+
+Merged-PR detection (squash merges, and any branch still on origin) needs an
+authenticated 'gh' and an origin on GitHub; without them, only pushed
+branches whose remote branch is gone and that origin's default branch
+contains count as merged.
+
+Each repo's own git config and hooks run as you, so only point this at a
+folder of repos you trust.
+
+The report prints call-to-action last: "Needs you", then "Resume here".
+"""
+
+import argparse
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+FETCH_JOBS = 8
+
+
+def git(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Runs git; an OSError, eg: a cwd it can't enter, reads as a failed command."""
+    try:
+        # Ref names and paths are bytes; surrogateescape round-trips any that
+        # aren't UTF-8 back into later git args.
+        return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, check=False,
+                              encoding="utf-8", errors="surrogateescape")
+    except OSError as e:
+        return subprocess.CompletedProcess(["git", *args], 126, "", os_error(e))
+
+
+def os_error(e: OSError) -> str:
+    """eg: "Permission denied: /path"; errors without a file, eg: EMFILE, have no path."""
+    detail = e.strerror or str(e)
+    return f"{detail}: {e.filename}" if e.filename else detail
+
+
+def out(*args: str, cwd: Path) -> str:
+    """git's stdout, stripped; empty when the command fails."""
+    result = git(*args, cwd=cwd)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def ok(*args: str, cwd: Path) -> bool:
+    return git(*args, cwd=cwd).returncode == 0
+
+
+def first_line(text: str) -> str:
+    return text.strip().split("\n", 1)[0]
+
+
+def refusal(path: Path, stderr: str) -> str:
+    """Why git won't work in a repo or worktree, with git's own fix when it's ownership."""
+    if "dubious ownership" in stderr:
+        return ("owned by another user, so git refuses it; to trust it: "
+                f"git config --global --add safe.directory {shlex.quote(str(path))}")
+    return f"git can't read it: {first_line(stderr).removeprefix('fatal: ')}"
+
+
+def count(n: int, noun: str) -> str:
+    """eg: "1 repo", "2 repos"."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+@dataclass
+class Report:
+    pulled: list[str] = field(default_factory=list)
+    current: list[str] = field(default_factory=list)
+    switched: list[tuple[str, str]] = field(default_factory=list)
+    deleted: list[tuple[str, str]] = field(default_factory=list)
+    no_origin: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
+    needs: list[tuple[str, str]] = field(default_factory=list)
+    resume: list[tuple[str, str]] = field(default_factory=list)
+    gh_failed_repos: int = 0
+    gh_error: str = ""
+
+
+def find_repos(root: Path) -> tuple[list[Path], list[Path]]:
+    """Dirs up to two levels under root (or root itself) holding a .git dir,
+    and the dirs that couldn't be searched for one.
+
+    A linked worktree has a .git file, not a dir, so it's reported with its
+    main repo rather than synced on its own.
+    """
+    repos, unreadable = [], []
+
+    def walk(d: Path, depth: int, in_repo: bool) -> None:
+        # os.path.isdir, unlike Path.is_dir before Python 3.14, returns False on
+        # a dir it can't stat rather than raising.
+        is_repo = os.path.isdir(d / ".git")
+        # A dir inside a repo below the root is searched only for nested repos,
+        # so one that can't be read, eg: a container volume, isn't reported.
+        quiet = is_repo or in_repo
+        if is_repo:
+            repos.append(d)
+        # Without search permission there's no telling whether it holds a .git.
+        elif not os.access(d, os.X_OK):
+            if not quiet:
+                unreadable.append(d)
+            return
+        if depth == 2:
+            return
+        try:
+            children = sorted(p for p in d.iterdir() if not os.path.islink(p) and os.path.isdir(p))
+        except OSError:
+            if not quiet:
+                unreadable.append(d)
+            return
+        for child in children:
+            if not child.name.startswith("."):
+                walk(child, depth + 1, quiet and depth > 0)
+
+    walk(root, 0, False)
+    return sorted(repos), sorted(unreadable)
+
+
+def fetch_env(repo: Path) -> dict[str, str]:
+    """An environment where credentials that need a prompt fail instead of
+    hanging, for the unattended git calls that reach origin: the parallel
+    fetch and 'set-head --auto'.
+
+    Git prefers 'GIT_SSH_COMMAND', then 'core.sshCommand', then 'GIT_SSH'; a
+    'GIT_SSH' that would actually be used is left alone, since setting
+    'GIT_SSH_COMMAND' would override it.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    ssh_cmd = os.environ.get("GIT_SSH_COMMAND") or out("config", "core.sshCommand", cwd=repo)
+    if ssh_cmd or not os.environ.get("GIT_SSH"):
+        env["GIT_SSH_COMMAND"] = f"{ssh_cmd or 'ssh'} -o BatchMode=yes"
+    return env
+
+
+def fetch(repo: Path) -> str | None:
+    """Fetches origin; returns the first line of git's error, or None on success."""
+    result = git("fetch", "--quiet", "--prune", "origin", cwd=repo, env=fetch_env(repo))
+    if result.returncode == 0:
+        return None
+    return first_line(result.stderr).removeprefix("fatal: ") or f"git exited {result.returncode}"
+
+
+def gh_repo(repo: Path) -> str | None:
+    """origin as gh's HOST/OWNER/REPO, eg: github.com/org/repo, or None if it
+    isn't on GitHub.
+
+    The configured URL comes first: an 'insteadOf' rewrite may point it at a
+    mirror or local path. The rewritten URL is the fallback, for shorthands
+    like 'gh:org/repo'.
+    """
+    for url in (out("config", "remote.origin.url", cwd=repo), out("remote", "get-url", "origin", cwd=repo)):
+        url = url.rstrip("/").removesuffix(".git")
+        if "://" in url:
+            url = url.split("://", 1)[1]
+            url = url.split("@", 1)[-1]
+        elif ":" in url:
+            url = url.split("@", 1)[-1].replace(":", "/", 1)
+        host, _, path = url.partition("/")
+        host = host.split(":", 1)[0]
+        if "github" in host and path:
+            return f"{host}/{path}"
+    return None
+
+
+def upstream_on_origin(repo: Path, branch: str) -> bool:
+    """True when the branch's upstream is on origin and origin's fetch covers
+    every branch, so a missing remote-tracking ref means the branch is gone
+    from origin. Other remotes aren't fetched here, and a single-branch clone
+    never tracks other branches.
+    """
+    if out("config", f"branch.{branch}.remote", cwd=repo) != "origin":
+        return False
+    return any("refs/heads/*" in spec for spec in out("config", "--get-all", "remote.origin.fetch", cwd=repo).split("\n"))
+
+
+def detect_op(git_dir: Path) -> tuple[str, str | None]:
+    """The operation in progress in a git dir, if any, and for a rebase the
+    branch being rebased ("" when unknown; None for other ops), since a rebase
+    detaches HEAD.
+    """
+    for d in ("rebase-merge", "rebase-apply"):
+        if (git_dir / d).is_dir():
+            try:
+                head = (git_dir / d / "head-name").read_text(encoding="utf-8", errors="surrogateescape").strip()
+            except OSError:
+                head = ""
+            head = head.removeprefix("refs/heads/")
+            return "rebase", "" if head == "detached HEAD" else head
+    if (git_dir / "MERGE_HEAD").exists():
+        return "merge", None
+    if (git_dir / "CHERRY_PICK_HEAD").exists():
+        return "cherry-pick", None
+    if (git_dir / "REVERT_HEAD").exists():
+        return "revert", None
+    # A multi-commit cherry-pick or revert keeps 'sequencer' between stops.
+    if (git_dir / "sequencer").is_dir():
+        return "cherry-pick/revert", None
+    return "", None
+
+
+def describe(cwd: Path) -> str:
+    """The checked-out state as a comma list, eg: "2 uncommitted, 1 unpushed", or "clean"."""
+    parts = []
+    branch = out("branch", "--show-current", cwd=cwd)
+    changed = len(out("status", "--porcelain", cwd=cwd).splitlines())
+    if changed:
+        parts.append(f"{changed} uncommitted")
+    if branch:
+        if ok("rev-parse", "--verify", "--quiet", "@{upstream}", cwd=cwd):
+            unpushed = int(out("rev-list", "--count", "@{upstream}..HEAD", cwd=cwd) or 0)
+            behind = int(out("rev-list", "--count", "HEAD..@{upstream}", cwd=cwd) or 0)
+            if unpushed:
+                parts.append(f"{unpushed} unpushed")
+            if behind:
+                parts.append(f"{behind} behind upstream")
+        elif out("config", f"branch.{branch}.merge", cwd=cwd):
+            parts.append("remote branch gone")
+        elif out("remote", cwd=cwd):
+            parts.append("never pushed")
+        else:
+            parts.append("no remote")
+    return ", ".join(parts) or "clean"
+
+
+def linked_worktrees(repo: Path) -> list[tuple[Path, str]]:
+    """(path, branch) for each linked worktree; branch is "" when detached."""
+    result = []
+    for block in out("worktree", "list", "--porcelain", cwd=repo).split("\n\n")[1:]:
+        path, branch = None, ""
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                path = Path(line.removeprefix("worktree "))
+            elif line.startswith("branch "):
+                branch = line.removeprefix("branch ").removeprefix("refs/heads/")
+        if path:
+            result.append((path, branch))
+    return result
+
+
+def on(branch: str) -> str:
+    """The checked-out branch as a row reads it, eg: "on main", or "detached"."""
+    return f"on {branch}" if branch else "detached"
+
+
+class RepoSync:
+    """Syncs one repo and records what happened in the shared report."""
+
+    def __init__(self, repo: Path, name: str, root: Path, report: Report, has_origin: bool, fetch_error: str | None):
+        self.repo, self.name, self.root, self.report = repo, name, root, report
+        self.has_origin, self.fetch_error = has_origin, fetch_error
+        self.git_dir = Path()
+        # Why the PR check can't run in this repo; once set, later branches skip gh.
+        self.gh_why = ""
+        self.merged_cache: dict[str, bool | None] = {}
+
+    def need(self, detail: str, where: str = "") -> None:
+        self.report.needs.append((where or self.name, detail))
+
+    def resume(self, detail: str, where: str = "") -> None:
+        self.report.resume.append((where or self.name, detail))
+
+    def run(self) -> None:
+        repo = self.repo
+        git_dir = git("rev-parse", "--absolute-git-dir", cwd=repo)
+        # Every later git call reads a refusal (eg: dubious ownership) as empty output.
+        if git_dir.returncode != 0:
+            self.need(refusal(repo, git_dir.stderr))
+            return
+        self.git_dir = Path(git_dir.stdout.strip())
+
+        # Active work is collected first, so it's reported even when the fetch
+        # fails or there's no origin.
+        in_worktree = self.collect_worktrees()
+
+        branch = out("branch", "--show-current", cwd=repo)
+        changed = bool(out("status", "--porcelain", cwd=repo))
+        op, rebasing = detect_op(self.git_dir)
+        if op:
+            shown = rebasing if rebasing is not None else branch
+            self.resume(f"{on(shown)}: {op} in progress")
+        elif not branch:
+            self.resume(f"detached at {out('rev-parse', '--short', 'HEAD', cwd=repo)}: {describe(repo)}")
+        elif changed:
+            self.resume(f"{on(branch)}: {describe(repo)}")
+
+        if not self.has_origin:
+            self.report.no_origin.append(self.name)
+            return
+        if self.fetch_error is not None:
+            self.need(f"fetch failed (prompts off): {self.fetch_error}; retry by hand: git fetch")
+            return
+
+        default = self.default_branch()
+        if not default:
+            if out("for-each-ref", "--count=1", "refs/remotes/origin", cwd=repo):
+                self.need("origin's default branch is unknown; set it with: git remote set-head origin <branch>")
+            else:
+                self.need("origin has no branches yet; nothing to sync until one is pushed")
+            return
+
+        # Active work, reported above, is left alone.
+        if op or not branch or changed:
+            return
+
+        if branch != default:
+            branch = self.maybe_switch_off(branch, default)
+
+        self.delete_merged(branch, default, in_worktree)
+        if self.gh_why.startswith("gh: "):
+            self.report.gh_failed_repos += 1
+            self.report.gh_error = self.report.gh_error or self.gh_why.removeprefix("gh: ")
+
+        if branch == default:
+            self.update_default(default)
+
+    def collect_worktrees(self) -> set[str]:
+        """Reports linked worktrees and returns the branches they hold."""
+        held = set()
+        for path, branch in linked_worktrees(self.repo):
+            if branch:
+                held.add(branch)
+            where = f"{path.relative_to(self.root) if path.is_relative_to(self.root) else path}/"
+            of = f"(worktree of {self.name.rstrip('/')})"
+            label = f"{on(branch)} {of}"
+            # Path.is_dir can't tell a missing worktree from one in a dir that
+            # isn't searchable: it returns False or raises, by Python version.
+            try:
+                missing = not stat.S_ISDIR(path.stat().st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                missing = True
+            except OSError:
+                missing = False
+            if missing:
+                self.need(f"{label}: missing; run: git worktree prune", where)
+                continue
+            if not os.access(path, os.R_OK | os.X_OK):
+                self.resume(f"{label}: can't read it, not checked", where)
+                continue
+            git_dir = git("rev-parse", "--absolute-git-dir", cwd=path)
+            if git_dir.returncode != 0:
+                self.need(f"{label}: {refusal(path, git_dir.stderr)}", where)
+                continue
+            op, rebasing = detect_op(Path(git_dir.stdout.strip()))
+            if op:
+                if rebasing:
+                    held.add(rebasing)
+                if rebasing is not None:
+                    label = f"{on(rebasing)} {of}"
+                self.resume(f"{label}: {op} in progress", where)
+            else:
+                self.resume(f"{label}: {describe(path)}", where)
+        return held
+
+    def default_branch(self) -> str:
+        """origin's default branch, re-resolved when 'origin/HEAD' is missing (some
+        clones) or dangling (origin renamed its default branch)."""
+
+        def resolve() -> str:
+            name = out("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=self.repo).removeprefix("origin/")
+            if name and ok("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{name}", cwd=self.repo):
+                return name
+            return ""
+
+        default = resolve()
+        if not default:
+            git("remote", "set-head", "origin", "--auto", cwd=self.repo, env=fetch_env(self.repo))
+            default = resolve()
+        return default
+
+    def is_merged(self, branch: str, default: str) -> bool | None:
+        """check_merged, cached so each branch costs at most one gh call."""
+        if branch not in self.merged_cache:
+            self.merged_cache[branch] = self.check_merged(branch, default)
+        return self.merged_cache[branch]
+
+    def check_merged(self, branch: str, default: str) -> bool | None:
+        """True if merged, False if not, None when only the PR check could tell
+        and it couldn't run (the reason is kept in 'gh_why').
+
+        A branch still on origin counts as merged only by a merged PR with its
+        exact tip; ancestry alone would delete a long-lived branch like
+        'develop' that's merged into main. A never-pushed branch also needs the
+        PR check, so a fresh branch isn't mistaken for a merged one. An
+        upstream that 'upstream_on_origin' can't vouch for is treated as never
+        pushed.
+        """
+        repo = self.repo
+        upstream = ""
+        gone = False
+        if upstream_on_origin(repo, branch):
+            upstream = out("config", f"branch.{branch}.merge", cwd=repo)
+            gone = bool(upstream) and not ok("rev-parse", "--verify", "--quiet", f"{branch}@{{upstream}}", cwd=repo)
+            if not gone and upstream == f"refs/heads/{default}":
+                return False
+        tip = out("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=repo)
+        if not tip:
+            return False
+        if gone and ok("merge-base", "--is-ancestor", tip, f"origin/{default}", cwd=repo):
+            return True
+        if self.gh_why:
+            return None
+        gh_target = gh_repo(repo)
+        if gh_target is None:
+            self.gh_why = "origin isn't on GitHub"
+            return None
+        # A PR's head is the remote branch name, which can differ from the local one.
+        head = upstream.removeprefix("refs/heads/") or branch
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "list", "-R", gh_target, "--state", "merged", "--base", default,
+                 "--limit", "200", "--head", head, "--json", "headRefOid", "--jq", ".[].headRefOid"],
+                capture_output=True, check=False, encoding="utf-8", errors="surrogateescape",
+            )
+        except FileNotFoundError:
+            self.gh_why = "gh not installed"
+            return None
+        except OSError as e:
+            self.gh_why = f"gh: {os_error(e)}"
+            return None
+        if result.returncode != 0:
+            err = first_line(result.stderr)
+            # gh puts its login hint on a later line for some failures, eg: an expired token.
+            if "gh auth login" in result.stderr and "gh auth login" not in err:
+                err += "; to log in: gh auth login"
+            self.gh_why = f"gh: {err}"
+            return None
+        return tip in result.stdout.split()
+
+    def maybe_switch_off(self, branch: str, default: str) -> str:
+        """Switches a merged, or pushed and even, branch off to the default
+        branch; returns the branch now checked out."""
+        repo = self.repo
+        tip = out("rev-parse", "HEAD", cwd=repo)
+        # An unborn branch has no tip, so its missing upstream would read as
+        # 'pushed and even' below.
+        if not tip:
+            self.resume(f"{on(branch)}: no commits yet")
+            return branch
+        if self.is_merged(branch, default):
+            reason = "merged"
+        elif (out("config", f"branch.{branch}.merge", cwd=repo) != f"refs/heads/{default}"
+              and out("rev-parse", "--verify", "--quiet", f"{branch}@{{upstream}}", cwd=repo) == tip):
+            reason = "pushed, branch kept"
+        else:
+            self.resume(f"{on(branch)}: {describe(repo)}")
+            return branch
+        result = git("switch", "--quiet", "--end-of-options", default, cwd=repo)
+        if result.returncode != 0:
+            self.need(f"{on(branch)}: couldn't switch to {default}: {first_line(result.stderr)}")
+            return branch
+        self.report.switched.append((self.name, f"from {branch} to {default} ({reason})"))
+        return default
+
+    def delete_merged(self, branch: str, default: str, in_worktree: set[str]) -> None:
+        """Deletes merged branches (not the checked-out, default, or worktree
+        ones), and flags gone-upstream branches not known to be merged."""
+        repo = self.repo
+        for b in out("for-each-ref", "refs/heads", "--format=%(refname:lstrip=2)", cwd=repo).splitlines():
+            if b in (branch, default) or b in in_worktree:
+                continue
+            merged = self.is_merged(b, default)
+            if merged:
+                tip = out("rev-parse", "--short", f"refs/heads/{b}", cwd=repo)
+                result = git("branch", "--quiet", "-D", "--end-of-options", b, cwd=repo)
+                if result.returncode == 0:
+                    self.report.deleted.append((self.name, f"branch {b} ({tip})"))
+                else:
+                    self.need(f"branch {b} is merged but couldn't be deleted: {first_line(result.stderr)}")
+                continue
+            track = out("for-each-ref", f"refs/heads/{b}", "--format=%(upstream:track)", cwd=repo)
+            if not (track == "[gone]" and upstream_on_origin(repo, b)):
+                continue
+            # Only suggest deleting a branch whose commits survive on some remote.
+            if out("for-each-ref", "--contains", f"refs/heads/{b}", "refs/remotes", cwd=repo):
+                hint = f"delete with: git branch -D {shlex.quote(b)}"
+            else:
+                lost = int(out("rev-list", "--count", f"refs/heads/{b}", "--not", "--remotes", cwd=repo) or 0)
+                hint = f"{count(lost, 'commit')} not on any remote"
+            if merged is None:
+                reason = "gh failed, see above" if self.gh_why.startswith("gh: ") else self.gh_why
+                if hint.startswith("delete"):
+                    hint = f"if merged, {hint}"
+                self.need(f"branch {b}: remote branch gone; couldn't check for a merged PR ({reason}); {hint}")
+            else:
+                self.need(f"branch {b}: remote branch gone, no merged PR found (closed?); {hint}")
+
+    def update_default(self, default: str) -> None:
+        """Brings the checked-out default branch up to origin's, like 'gup'."""
+        repo = self.repo
+        ahead = int(out("rev-list", "--count", f"origin/{default}..HEAD", cwd=repo) or 0)
+        behind = int(out("rev-list", "--count", f"HEAD..origin/{default}", cwd=repo) or 0)
+        if not behind:
+            self.report.current.append(self.name)
+        elif not ahead:
+            result = git("merge", "--quiet", "--ff-only", f"origin/{default}", cwd=repo)
+            if result.returncode != 0:
+                self.need(f"{on(default)}: fast-forward to origin/{default} failed: {first_line(result.stderr)}")
+                return
+            self.report.pulled.append(f"{self.name} (+{behind})")
+        else:
+            result = git("rebase", "--quiet", f"origin/{default}", cwd=repo)
+            if result.returncode != 0:
+                if (self.git_dir / "rebase-merge").is_dir() or (self.git_dir / "rebase-apply").is_dir():
+                    git("rebase", "--abort", cwd=repo)
+                    verb = "conflicts" if ahead == 1 else "conflict"
+                    self.need(f"{on(default)}: {count(ahead, 'local commit')} {verb} with {behind} new on "
+                              f"origin/{default}; left unchanged, rebase by hand: git pull --rebase")
+                else:
+                    self.need(f"{on(default)}: rebase onto origin/{default} failed: {first_line(result.stderr)}")
+                return
+            self.report.pulled.append(f"{self.name} (+{behind})")
+            ahead = int(out("rev-list", "--count", f"origin/{default}..HEAD", cwd=repo) or 0)
+        if ahead:
+            self.need(f"{on(default)}: {ahead} unpushed")
+
+
+def section(title: str, entries: list[tuple[str, str]]) -> None:
+    """Prints "path/  detail" entries as aligned columns under a heading."""
+    if not entries:
+        return
+    width = max(len(name) for name, _ in entries)
+    print()
+    print(title)
+    for name, detail in entries:
+        print(f"  {name.ljust(width)}  {detail}")
+
+
+def print_report(report: Report, repo_count: int, root: Path) -> None:
+    print()
+    print(f"{count(repo_count, 'repo')} under {root}")
+    if report.pulled:
+        print(f"Pulled:     {', '.join(report.pulled)}")
+    if report.current:
+        print(f"Up to date: {count(len(report.current), 'repo')}")
+    skipped = []
+    if report.no_origin:
+        skipped.append(f"no origin: {', '.join(report.no_origin)}")
+    if report.unreadable:
+        skipped.append(f"can't read: {', '.join(report.unreadable)}")
+    if skipped:
+        print(f"Skipped:    {'; '.join(skipped)}")
+    section("Switched to default branch:", report.switched)
+    section("Deleted merged branches (undo: git branch <name> <sha>):", report.deleted)
+    section("Needs you:", report.needs)
+    section("Resume here:", report.resume)
+    if not report.needs and not report.resume:
+        print()
+        print("All clear: nothing needs you, nothing in progress.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="gup-all", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("root", nargs="?", default=str(Path.home() / "work"),
+                        help="folder to sync (default: $HOME/work)")
+    args = parser.parse_args()
+
+    root = Path(args.root)
+    if not os.path.isdir(root):
+        print(f"gup-all: error: {root} is not a directory", file=sys.stderr)
+        return 1
+    root = root.resolve()
+    if not shutil.which("git"):
+        print("gup-all: error: git not found on PATH", file=sys.stderr)
+        return 1
+
+    # Paths relative to the root printed in the report's first line, with a
+    # trailing slash so they read as dirs, not branches.
+    def name(d: Path) -> str:
+        return "./" if d == root else f"{d.relative_to(root)}/"
+
+    repos, unreadable = find_repos(root)
+    if not repos and unreadable:
+        print(f"gup-all: error: no readable git repos under {root}; can't read: {', '.join(map(name, unreadable))}",
+              file=sys.stderr)
+        return 1
+    if not repos:
+        print(f"gup-all: error: no git repos found under {root} (looks two levels down, eg: {root}/org/repo)",
+              file=sys.stderr)
+        return 1
+
+    print(f"Fetching {count(len(repos), 'repo')} under {root} ...", file=sys.stderr)
+    with_origin = [r for r in repos if ok("remote", "get-url", "origin", cwd=r)]
+    with ThreadPoolExecutor(max_workers=FETCH_JOBS) as pool:
+        fetch_errors = dict(zip(with_origin, pool.map(fetch, with_origin)))
+
+    print("Syncing ...", file=sys.stderr)
+    report = Report(unreadable=[name(d) for d in unreadable])
+    code = 0
+    for repo in repos:
+        # Neither a crash nor Ctrl-C may lose the report: it holds the undo
+        # shas of branches already deleted in other repos.
+        try:
+            RepoSync(repo, name(repo), root, report, repo in fetch_errors, fetch_errors.get(repo)).run()
+        except KeyboardInterrupt:
+            report.needs.append((name(repo), "interrupted here, repo may be partly synced; later repos not synced"))
+            code = 130
+            break
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            detail = f"gup-all bug, repo partly synced (traceback above): {type(e).__name__}: {e}"
+            report.needs.append((name(repo), detail))
+
+    # gh failures are usually auth or rate limits, which hit every repo alike,
+    # so they're reported once, with the first error.
+    if report.gh_failed_repos:
+        failed = count(report.gh_failed_repos, "repo")
+        detail = f"merged PRs not checked in {failed}, so their branches were kept: {report.gh_error}"
+        report.needs.insert(0, ("gh", detail))
+
+    print_report(report, len(repos), root)
+    return code
+
+
+if __name__ == "__main__":
+    # Prints names that aren't UTF-8 back as the bytes git gave. stdout is
+    # None when closed, eg: gup-all >&-
+    if sys.stdout:
+        sys.stdout.reconfigure(errors="surrogateescape")
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("gup-all: interrupted; repos may be partly synced", file=sys.stderr)
+        sys.exit(130)

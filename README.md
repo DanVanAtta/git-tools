@@ -6,6 +6,7 @@ Helper scripts to make working with git easier.
 
 - Clone this repository.
 - Add the cloned folder to your path
+- 'gup-all' needs uv (https://docs.astral.sh/uv/) on your path; it runs itself through 'uv run --script'.
 
 
 ## Various additional useful commands
